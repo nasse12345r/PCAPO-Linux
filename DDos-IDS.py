@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 # ─── ARGPARSE CONFIGURATION ────────────────────────────
 parser = argparse.ArgumentParser(description="FYP DDoS Detection System")
 parser.add_argument("-i", "--interface", type=str, default="eth0", help="Network interface to monitor (default: eth0)")
-parser.add_argument("-t", "--time", type=int, default=5, help="Capture time per cycle in seconds (default: 5)")
+parser.add_argument("-t", "--time", type=int, default=10, help="Capture time per cycle in seconds (default: 10)")
 parser.add_argument("-m", "--model_dir", type=str, default="./", help="Directory containing ML models")
 parser.add_argument("-p", "--pcap_dir", type=str, default="/dev/shm", help="Directory to store temporary pcap files (default: /dev/shm)")
 args = parser.parse_args()
@@ -34,8 +34,8 @@ CAPTURE_TIME = args.time
 MODEL_PATH = args.model_dir
 PCAP_DIR = args.pcap_dir
 
-# Global queue for inter-thread communication
-analysis_queue = queue.Queue()
+# Global queue for inter-thread communication (Bounded to prevent memory leaks/processing lag)
+analysis_queue = queue.Queue(maxsize=2)
 
 # ─── LOAD MODELS ──────────────────────────────────────
 try:
@@ -305,8 +305,16 @@ if __name__ == "__main__":
         while True:
             pcap_path = capture_traffic(cycle)
             if pcap_path:
-                # Put the captured file in the queue for the analyzer thread
-                analysis_queue.put((cycle, pcap_path))
+                try:
+                    # Try to put the file in the queue without blocking
+                    analysis_queue.put_nowait((cycle, pcap_path))
+                except queue.Full:
+                    # LOAD SHEDDING: If the analyzer is too far behind, drop the capture to stay real-time
+                    logger.warning(f"Queue full! Analyzer is lagging. Dropping Cycle {cycle} to maintain real-time monitoring.")
+                    try:
+                        os.remove(pcap_path)
+                    except Exception as e:
+                        logger.error(f"Failed to delete dropped pcap {pcap_path}: {e}")
             cycle += 1
     except KeyboardInterrupt:
         logger.info("Detection system stopped by user")
