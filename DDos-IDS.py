@@ -8,7 +8,6 @@ import argparse
 import logging
 import threading
 import queue
-from nfstream import NFStreamer
 
 # ─── LOGGING CONFIGURATION ─────────────────────────────
 logging.basicConfig(
@@ -76,20 +75,32 @@ def capture_traffic(cycle):
         return None
 
 def pcap_to_flows(pcap_path):
-    """Convert pcap to flow features using NFStream"""
-    logger.debug(f"Converting packets to flows from {pcap_path}...")
+    """Convert pcap to flow features using CICFlowMeter"""
+    csv_path = pcap_path.replace('.pcap', '.csv')
+    logger.debug(f"Converting packets to flows from {pcap_path} using CICFlowMeter...")
     try:
         if not os.path.exists(pcap_path):
             logger.warning(f"pcap file not found: {pcap_path}")
             return None
 
-        streamer = NFStreamer(
-            source=pcap_path,
-            statistical_analysis=True,
-            splt_analysis=0
-        )
+        # Run cicflowmeter as a subprocess
+        proc = subprocess.Popen([
+            'cicflowmeter', '-f', pcap_path, '-c', csv_path
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        proc.wait()
 
-        df = streamer.to_pandas()
+        if not os.path.exists(csv_path):
+            logger.warning(f"CICFlowMeter failed to generate CSV for {pcap_path}")
+            return None
+
+        # Load the generated CSV
+        df = pd.read_csv(csv_path)
+
+        # Clean up the CSV file
+        try:
+            os.remove(csv_path)
+        except:
+            pass
 
         if df is None or len(df) == 0:
             logger.warning(f"No flows extracted from {pcap_path}")
@@ -102,102 +113,112 @@ def pcap_to_flows(pcap_path):
         return None
 
 def preprocess_flows(df):
-    """Map NFStream columns to match training features"""
+    """Format CICFlowMeter output to match exactly the training features"""
+    # CICFlowMeter python outputs columns in lowercase, but the dataset is capitalized/spaces.
+    # We must normalize the column names to match the expected format.
+
+    # First, strip leading/trailing spaces
+    df.columns = df.columns.str.strip()
+
+    # CICFlowMeter-py often uses lowercase with underscores, e.g., 'flow_duration'
+    # We map them to the CIC-DDoS2019 format.
     col_map = {
-        'protocol':                      'Protocol',
-        'bidirectional_duration_ms':     'Flow Duration',
-        'src2dst_packets':               'Total Fwd Packets',
-        'dst2src_packets':               'Total Backward Packets',
-        'src2dst_bytes':                 'Total Length of Fwd Packets',
-        'dst2src_bytes':                 'Total Length of Bwd Packets',
-        'src2dst_max_ps':                'Fwd Packet Length Max',
-        'src2dst_min_ps':                'Fwd Packet Length Min',
-        'src2dst_mean_ps':               'Fwd Packet Length Mean',
-        'src2dst_stddev_ps':             'Fwd Packet Length Std',
-        'dst2src_max_ps':                'Bwd Packet Length Max',
-        'dst2src_min_ps':                'Bwd Packet Length Min',
-        'dst2src_mean_ps':               'Bwd Packet Length Mean',
-        'dst2src_stddev_ps':             'Bwd Packet Length Std',
-        'bidirectional_mean_ps':         'Packet Length Mean',
-        'bidirectional_stddev_ps':       'Packet Length Std',
-        'bidirectional_max_ps':          'Max Packet Length',
-        'bidirectional_min_ps':          'Min Packet Length',
-        'src2dst_mean_piat_ms':          'Fwd IAT Mean',
-        'src2dst_stddev_piat_ms':        'Fwd IAT Std',
-        'src2dst_max_piat_ms':           'Fwd IAT Max',
-        'src2dst_min_piat_ms':           'Fwd IAT Min',
-        'dst2src_mean_piat_ms':          'Bwd IAT Mean',
-        'dst2src_stddev_piat_ms':        'Bwd IAT Std',
-        'dst2src_max_piat_ms':           'Bwd IAT Max',
-        'dst2src_min_piat_ms':           'Bwd IAT Min',
-        'bidirectional_mean_piat_ms':    'Flow IAT Mean',
-        'bidirectional_stddev_piat_ms':  'Flow IAT Std',
-        'bidirectional_max_piat_ms':     'Flow IAT Max',
-        'bidirectional_min_piat_ms':     'Flow IAT Min',
-        'bidirectional_syn_packets':     'SYN Flag Count',
-        'bidirectional_fin_packets':     'FIN Flag Count',
-        'bidirectional_rst_packets':     'RST Flag Count',
-        'bidirectional_psh_packets':     'PSH Flag Count',
-        'bidirectional_ack_packets':     'ACK Flag Count',
-        'bidirectional_urg_packets':     'URG Flag Count',
-        'bidirectional_ece_packets':     'ECE Flag Count',
-        'bidirectional_cwr_packets':     'CWE Flag Count',
-        'src2dst_syn_packets':           'Fwd PSH Flags',
-        'src2dst_fin_packets':           'Fwd URG Flags',
-        'dst2src_syn_packets':           'Bwd PSH Flags',
-        'dst2src_fin_packets':           'Bwd URG Flags',
-        'src2dst_duration_ms':           'Fwd IAT Total',
-        'dst2src_duration_ms':           'Bwd IAT Total',
-        'bidirectional_packets':         'Subflow Fwd Packets',
-        'bidirectional_bytes':           'Subflow Fwd Bytes',
+        'flow_duration': 'Flow Duration',
+        'tot_fwd_pkts': 'Total Fwd Packets',
+        'tot_bwd_pkts': 'Total Backward Packets',
+        'totlen_fwd_pkts': 'Total Length of Fwd Packets',
+        'totlen_bwd_pkts': 'Total Length of Bwd Packets',
+        'fwd_pkt_len_max': 'Fwd Packet Length Max',
+        'fwd_pkt_len_min': 'Fwd Packet Length Min',
+        'fwd_pkt_len_mean': 'Fwd Packet Length Mean',
+        'fwd_pkt_len_std': 'Fwd Packet Length Std',
+        'bwd_pkt_len_max': 'Bwd Packet Length Max',
+        'bwd_pkt_len_min': 'Bwd Packet Length Min',
+        'bwd_pkt_len_mean': 'Bwd Packet Length Mean',
+        'bwd_pkt_len_std': 'Bwd Packet Length Std',
+        'flow_byts_s': 'Flow Bytes/s',
+        'flow_pkts_s': 'Flow Packets/s',
+        'flow_iat_mean': 'Flow IAT Mean',
+        'flow_iat_std': 'Flow IAT Std',
+        'flow_iat_max': 'Flow IAT Max',
+        'flow_iat_min': 'Flow IAT Min',
+        'fwd_iat_tot': 'Fwd IAT Total',
+        'fwd_iat_mean': 'Fwd IAT Mean',
+        'fwd_iat_std': 'Fwd IAT Std',
+        'fwd_iat_max': 'Fwd IAT Max',
+        'fwd_iat_min': 'Fwd IAT Min',
+        'bwd_iat_tot': 'Bwd IAT Total',
+        'bwd_iat_mean': 'Bwd IAT Mean',
+        'bwd_iat_std': 'Bwd IAT Std',
+        'bwd_iat_max': 'Bwd IAT Max',
+        'bwd_iat_min': 'Bwd IAT Min',
+        'fwd_psh_flags': 'Fwd PSH Flags',
+        'bwd_psh_flags': 'Bwd PSH Flags',
+        'fwd_urg_flags': 'Fwd URG Flags',
+        'bwd_urg_flags': 'Bwd URG Flags',
+        'fwd_header_len': 'Fwd Header Length',
+        'bwd_header_len': 'Bwd Header Length',
+        'fwd_pkts_s': 'Fwd Packets/s',
+        'bwd_pkts_s': 'Bwd Packets/s',
+        'pkt_len_min': 'Min Packet Length',
+        'pkt_len_max': 'Max Packet Length',
+        'pkt_len_mean': 'Packet Length Mean',
+        'pkt_len_std': 'Packet Length Std',
+        'pkt_len_var': 'Packet Length Variance',
+        'fin_flag_cnt': 'FIN Flag Count',
+        'syn_flag_cnt': 'SYN Flag Count',
+        'rst_flag_cnt': 'RST Flag Count',
+        'psh_flag_cnt': 'PSH Flag Count',
+        'ack_flag_cnt': 'ACK Flag Count',
+        'urg_flag_cnt': 'URG Flag Count',
+        'cwe_flag_count': 'CWE Flag Count',
+        'ece_flag_cnt': 'ECE Flag Count',
+        'down_up_ratio': 'Down/Up Ratio',
+        'pkt_size_avg': 'Average Packet Size',
+        'fwd_seg_size_avg': 'Avg Fwd Segment Size',
+        'bwd_seg_size_avg': 'Avg Bwd Segment Size',
+        'fwd_header_len': 'Fwd Header Length.1', # Some datasets map this twice
+        'fwd_byts_b_avg': 'Fwd Avg Bytes/Bulk',
+        'fwd_pkts_b_avg': 'Fwd Avg Packets/Bulk',
+        'fwd_blk_rate_avg': 'Fwd Avg Bulk Rate',
+        'bwd_byts_b_avg': 'Bwd Avg Bytes/Bulk',
+        'bwd_pkts_b_avg': 'Bwd Avg Packets/Bulk',
+        'bwd_blk_rate_avg': 'Bwd Avg Bulk Rate',
+        'subflow_fwd_pkts': 'Subflow Fwd Packets',
+        'subflow_fwd_byts': 'Subflow Fwd Bytes',
+        'subflow_bwd_pkts': 'Subflow Bwd Packets',
+        'subflow_bwd_byts': 'Subflow Bwd Bytes',
+        'init_fwd_win_byts': 'Init_Win_bytes_forward',
+        'init_bwd_win_byts': 'Init_Win_bytes_backward',
+        'fwd_act_data_pkts': 'act_data_pkt_fwd',
+        'fwd_seg_size_min': 'min_seg_size_forward',
+        'active_mean': 'Active Mean',
+        'active_std': 'Active Std',
+        'active_max': 'Active Max',
+        'active_min': 'Active Min',
+        'idle_mean': 'Idle Mean',
+        'idle_std': 'Idle Std',
+        'idle_max': 'Idle Max',
+        'idle_min': 'Idle Min'
     }
 
-    df = df.rename(columns=col_map)
-    duration_s = df['Flow Duration'] / 1000.0  # ms to seconds
+    # Rename columns if they are in the lowercase format
+    df.rename(columns=col_map, inplace=True)
 
-    # Safe divisions to avoid divide by zero errors/warnings
-    safe_duration = duration_s.replace(0, np.nan)
-    df['Flow Bytes/s'] = ((df['Total Length of Fwd Packets'] + df['Total Length of Bwd Packets']) / safe_duration).fillna(0)
-    df['Flow Packets/s'] = ((df['Total Fwd Packets'] + df['Total Backward Packets']) / safe_duration).fillna(0)
-    df['Fwd Packets/s'] = (df['Total Fwd Packets'] / safe_duration).fillna(0)
-    df['Bwd Packets/s'] = (df['Total Backward Packets'] / safe_duration).fillna(0)
+    # Capitalize 'protocol' if it didn't get mapped
+    if 'protocol' in df.columns:
+        df.rename(columns={'protocol': 'Protocol'}, inplace=True)
 
-    df['Packet Length Variance'] = df['Packet Length Std'] ** 2
-
-    total_pkts = df['Total Fwd Packets'] + df['Total Backward Packets']
-    safe_total_pkts = total_pkts.replace(0, np.nan)
-    df['Average Packet Size'] = ((df['Total Length of Fwd Packets'] + df['Total Length of Bwd Packets']) / safe_total_pkts).fillna(0)
-
-    df['Avg Fwd Segment Size'] = df['Fwd Packet Length Mean']
-    df['Avg Bwd Segment Size'] = df['Bwd Packet Length Mean']
-    df['Fwd Header Length']   = df['Total Fwd Packets'] * 20
-    df['Bwd Header Length']   = df['Total Backward Packets'] * 20
-    df['Fwd Header Length.1'] = df['Fwd Header Length']
-    df['Subflow Bwd Packets'] = df['Total Backward Packets']
-    df['Subflow Bwd Bytes']   = df['Total Length of Bwd Packets']
-
-    safe_fwd_pkts = df['Total Fwd Packets'].replace(0, np.nan)
-    df['Down/Up Ratio'] = (df['Total Backward Packets'] / safe_fwd_pkts).fillna(0)
-
-    # Bulk features — set to 0 (not available in NFStream)
-    missing_cols = ['Fwd Avg Bytes/Bulk', 'Fwd Avg Packets/Bulk', 'Fwd Avg Bulk Rate',
-                    'Bwd Avg Bytes/Bulk', 'Bwd Avg Packets/Bulk', 'Bwd Avg Bulk Rate',
-                    'Init_Win_bytes_forward', 'Init_Win_bytes_backward',
-                    'act_data_pkt_fwd', 'min_seg_size_forward',
-                    'Active Mean', 'Active Std', 'Active Max', 'Active Min',
-                    'Idle Mean', 'Idle Std', 'Idle Max', 'Idle Min', 'Inbound']
-
-    # Efficiently add missing columns
-    missing_df = pd.DataFrame(0, index=df.index, columns=missing_cols)
-    df = pd.concat([df, missing_df], axis=1)
-
+    # Build final dataframe in exact training feature order
     final_df = pd.DataFrame()
     for col in features:
         if col in df.columns:
-            final_df[col] = df[col].values
+            # Convert values to numeric, coercing errors to NaN
+            final_df[col] = pd.to_numeric(df[col], errors='coerce')
         else:
             final_df[col] = 0
 
+    # Handle infinities and NaN
     final_df.replace([np.inf, -np.inf], np.nan, inplace=True)
     final_df.fillna(0, inplace=True)
 
@@ -212,10 +233,25 @@ def detect(df, raw_df, cycle):
     total = len(df)
 
     # ── Protocol Rule-Based Detection ────────────────────────
-    syn_ratio = (raw_df['bidirectional_syn_packets'] == 1).mean() if 'bidirectional_syn_packets' in raw_df.columns else 0
-    zero_dur_ratio = (raw_df['bidirectional_duration_ms'] == 0).mean() if 'bidirectional_duration_ms' in raw_df.columns else 0
-    single_src = raw_df['src_ip'].nunique() if 'src_ip' in raw_df.columns else 0
-    total_packets = raw_df['bidirectional_packets'].sum() if 'bidirectional_packets' in raw_df.columns else 0
+    # Try to find SYN and Duration columns whether they are lowercase or mapped
+    syn_col = 'syn_flag_cnt' if 'syn_flag_cnt' in raw_df.columns else 'SYN Flag Count'
+    dur_col = 'flow_duration' if 'flow_duration' in raw_df.columns else 'Flow Duration'
+    src_col = 'src_ip' if 'src_ip' in raw_df.columns else ('Source IP' if 'Source IP' in raw_df.columns else None)
+
+    syn_ratio = (raw_df[syn_col] >= 1).mean() if syn_col in raw_df.columns else 0
+    zero_dur_ratio = (raw_df[dur_col] == 0).mean() if dur_col in raw_df.columns else 0
+    single_src = raw_df[src_col].nunique() if src_col else 0
+
+    # Packets could be mapped to 'Total Fwd Packets' and 'Total Backward Packets'
+    fwd_pkts = 'tot_fwd_pkts' if 'tot_fwd_pkts' in raw_df.columns else 'Total Fwd Packets'
+    bwd_pkts = 'tot_bwd_pkts' if 'tot_bwd_pkts' in raw_df.columns else 'Total Backward Packets'
+
+    if fwd_pkts in raw_df.columns and bwd_pkts in raw_df.columns:
+        # Convert to numeric to avoid string concatenation issues
+        total_packets = pd.to_numeric(raw_df[fwd_pkts], errors='coerce').fillna(0).sum() + pd.to_numeric(raw_df[bwd_pkts], errors='coerce').fillna(0).sum()
+    else:
+        total_packets = 0
+
     pkt_per_flow = total_packets / total if total > 0 else 0
 
     rule_ddos = False
