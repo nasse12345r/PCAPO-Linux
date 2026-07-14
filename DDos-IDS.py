@@ -3,59 +3,84 @@ import pandas as pd
 import numpy as np
 import subprocess
 import os
-import glob
 import time
+import argparse
+import logging
+import threading
+import queue
 from nfstream import NFStreamer
 
-# ─── CONFIG ───────────────────────────────────────────
-MODEL_PATH   = '/home/DS/Desktop/FYP/models/'
-PCAP_FILE    = '/tmp/capture.pcap'
-INTERFACE    = 'eth0'
-CAPTURE_TIME = 5
-# ──────────────────────────────────────────────────────
+# ─── LOGGING CONFIGURATION ─────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.FileHandler("ids_alerts.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
-# Load models
-print("[*] Loading models...")
-rf       = joblib.load(MODEL_PATH + 'random_forest.pkl')
-xgb      = joblib.load(MODEL_PATH + 'xgboost.pkl')
-iso      = joblib.load(MODEL_PATH + 'isolation_forest.pkl')
-scaler   = joblib.load(MODEL_PATH + 'scaler.pkl')
-features = joblib.load(MODEL_PATH + 'feature_names.pkl')
-print("[+] Models loaded successfully\n")
+# ─── ARGPARSE CONFIGURATION ────────────────────────────
+parser = argparse.ArgumentParser(description="FYP DDoS Detection System")
+parser.add_argument("-i", "--interface", type=str, default="eth0", help="Network interface to monitor (default: eth0)")
+parser.add_argument("-t", "--time", type=int, default=5, help="Capture time per cycle in seconds (default: 5)")
+parser.add_argument("-m", "--model_dir", type=str, default="./", help="Directory containing ML models")
+parser.add_argument("-p", "--pcap_dir", type=str, default="/dev/shm", help="Directory to store temporary pcap files (default: /dev/shm)")
+args = parser.parse_args()
 
-def capture_traffic():
-    """Capture live traffic for CAPTURE_TIME seconds"""
-    print(f"[*] Capturing traffic on {INTERFACE} for {CAPTURE_TIME}s...")
+INTERFACE = args.interface
+CAPTURE_TIME = args.time
+MODEL_PATH = args.model_dir
+PCAP_DIR = args.pcap_dir
+
+# Global queue for inter-thread communication
+analysis_queue = queue.Queue()
+
+# ─── LOAD MODELS ──────────────────────────────────────
+try:
+    logger.info("Loading models...")
+    rf       = joblib.load(os.path.join(MODEL_PATH, 'random_forest.pkl'))
+    xgb      = joblib.load(os.path.join(MODEL_PATH, 'xgboost.pkl'))
+    iso      = joblib.load(os.path.join(MODEL_PATH, 'isolation_forest.pkl'))
+    scaler   = joblib.load(os.path.join(MODEL_PATH, 'scaler.pkl'))
+    features = joblib.load(os.path.join(MODEL_PATH, 'feature_names.pkl'))
+    logger.info("Models loaded successfully")
+except Exception as e:
+    logger.error(f"Failed to load models: {e}")
+    exit(1)
+
+def capture_traffic(cycle):
+    """Capture live traffic for CAPTURE_TIME seconds and save to a unique file."""
+    pcap_file = os.path.join(PCAP_DIR, f"capture_{cycle}.pcap")
+    logger.info(f"Capturing traffic on {INTERFACE} for {CAPTURE_TIME}s (Cycle {cycle})...")
+
     try:
-        # Remove old pcap first
-        if os.path.exists(PCAP_FILE):
-            os.remove(PCAP_FILE)
+        if os.path.exists(pcap_file):
+            os.remove(pcap_file)
 
-        # Use simple tcpdump without -G and -W flags
         proc = subprocess.Popen([
             'tcpdump', '-i', INTERFACE,
-            '-w', PCAP_FILE,
+            '-w', pcap_file,
             '-B', '8192',  # Allocates an 8MB buffer to stop kernel drops
             '--immediate-mode'
-        ])
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-        # Let it run for CAPTURE_TIME seconds then stop
         time.sleep(CAPTURE_TIME)
         proc.terminate()
         proc.wait()
 
-        print("[+] Capture complete")
-        return True
+        return pcap_file
     except Exception as e:
-        print(f"[-] Capture error: {e}")
-        return False
+        logger.error(f"Capture error: {e}")
+        return None
 
 def pcap_to_flows(pcap_path):
     """Convert pcap to flow features using NFStream"""
-    print("[*] Converting packets to flows...")
+    logger.debug(f"Converting packets to flows from {pcap_path}...")
     try:
         if not os.path.exists(pcap_path):
-            print("[-] pcap file not found")
+            logger.warning(f"pcap file not found: {pcap_path}")
             return None
 
         streamer = NFStreamer(
@@ -67,20 +92,17 @@ def pcap_to_flows(pcap_path):
         df = streamer.to_pandas()
 
         if df is None or len(df) == 0:
-            print("[-] No flows extracted")
+            logger.warning(f"No flows extracted from {pcap_path}")
             return None
 
-        print(f"[+] Extracted {len(df)} flows")
         return df
 
     except Exception as e:
-        print(f"[-] Flow extraction error: {e}")
+        logger.error(f"Flow extraction error: {e}")
         return None
 
 def preprocess_flows(df):
     """Map NFStream columns to match training features"""
-
-    # Direct mappings
     col_map = {
         'protocol':                      'Protocol',
         'bidirectional_duration_ms':     'Flow Duration',
@@ -131,57 +153,44 @@ def preprocess_flows(df):
     }
 
     df = df.rename(columns=col_map)
-
-    # Calculate derived features
     duration_s = df['Flow Duration'] / 1000.0  # ms to seconds
 
-    # Flow Bytes/s and Flow Packets/s
-    df['Flow Bytes/s'] = (
-        df['Total Length of Fwd Packets'] + df['Total Length of Bwd Packets']
-    ) / duration_s.replace(0, np.nan)
+    # Safe divisions to avoid divide by zero errors/warnings
+    safe_duration = duration_s.replace(0, np.nan)
+    df['Flow Bytes/s'] = ((df['Total Length of Fwd Packets'] + df['Total Length of Bwd Packets']) / safe_duration).fillna(0)
+    df['Flow Packets/s'] = ((df['Total Fwd Packets'] + df['Total Backward Packets']) / safe_duration).fillna(0)
+    df['Fwd Packets/s'] = (df['Total Fwd Packets'] / safe_duration).fillna(0)
+    df['Bwd Packets/s'] = (df['Total Backward Packets'] / safe_duration).fillna(0)
 
-    df['Flow Packets/s'] = (
-        df['Total Fwd Packets'] + df['Total Backward Packets']
-    ) / duration_s.replace(0, np.nan)
-
-    df['Fwd Packets/s'] = df['Total Fwd Packets'] / duration_s.replace(0, np.nan)
-    df['Bwd Packets/s'] = df['Total Backward Packets'] / duration_s.replace(0, np.nan)
-
-    # Packet length variance
     df['Packet Length Variance'] = df['Packet Length Std'] ** 2
 
-    # Average packet size
-    df['Average Packet Size'] = (
-        df['Total Length of Fwd Packets'] + df['Total Length of Bwd Packets']
-    ) / (df['Total Fwd Packets'] + df['Total Backward Packets']).replace(0, np.nan)
+    total_pkts = df['Total Fwd Packets'] + df['Total Backward Packets']
+    safe_total_pkts = total_pkts.replace(0, np.nan)
+    df['Average Packet Size'] = ((df['Total Length of Fwd Packets'] + df['Total Length of Bwd Packets']) / safe_total_pkts).fillna(0)
 
-    # Segment sizes same as mean packet lengths
     df['Avg Fwd Segment Size'] = df['Fwd Packet Length Mean']
     df['Avg Bwd Segment Size'] = df['Bwd Packet Length Mean']
-
-    # Header lengths estimated
     df['Fwd Header Length']   = df['Total Fwd Packets'] * 20
     df['Bwd Header Length']   = df['Total Backward Packets'] * 20
     df['Fwd Header Length.1'] = df['Fwd Header Length']
-
-    # Subflow bytes
     df['Subflow Bwd Packets'] = df['Total Backward Packets']
     df['Subflow Bwd Bytes']   = df['Total Length of Bwd Packets']
 
-    # Down/Up ratio
-    df['Down/Up Ratio'] = df['Total Backward Packets'] / \
-                          df['Total Fwd Packets'].replace(0, np.nan)
+    safe_fwd_pkts = df['Total Fwd Packets'].replace(0, np.nan)
+    df['Down/Up Ratio'] = (df['Total Backward Packets'] / safe_fwd_pkts).fillna(0)
 
     # Bulk features — set to 0 (not available in NFStream)
-    for col in ['Fwd Avg Bytes/Bulk', 'Fwd Avg Packets/Bulk', 'Fwd Avg Bulk Rate',
-                'Bwd Avg Bytes/Bulk', 'Bwd Avg Packets/Bulk', 'Bwd Avg Bulk Rate',
-                'Init_Win_bytes_forward', 'Init_Win_bytes_backward',
-                'act_data_pkt_fwd', 'min_seg_size_forward',
-                'Active Mean', 'Active Std', 'Active Max', 'Active Min',
-                'Idle Mean', 'Idle Std', 'Idle Max', 'Idle Min', 'Inbound']:
-        df[col] = 0
+    missing_cols = ['Fwd Avg Bytes/Bulk', 'Fwd Avg Packets/Bulk', 'Fwd Avg Bulk Rate',
+                    'Bwd Avg Bytes/Bulk', 'Bwd Avg Packets/Bulk', 'Bwd Avg Bulk Rate',
+                    'Init_Win_bytes_forward', 'Init_Win_bytes_backward',
+                    'act_data_pkt_fwd', 'min_seg_size_forward',
+                    'Active Mean', 'Active Std', 'Active Max', 'Active Min',
+                    'Idle Mean', 'Idle Std', 'Idle Max', 'Idle Min', 'Inbound']
 
-    # Build final dataframe in exact training feature order
+    # Efficiently add missing columns
+    missing_df = pd.DataFrame(0, index=df.index, columns=missing_cols)
+    df = pd.concat([df, missing_df], axis=1)
+
     final_df = pd.DataFrame()
     for col in features:
         if col in df.columns:
@@ -189,50 +198,37 @@ def preprocess_flows(df):
         else:
             final_df[col] = 0
 
-    # Handle infinities and NaN
     final_df.replace([np.inf, -np.inf], np.nan, inplace=True)
     final_df.fillna(0, inplace=True)
 
     return final_df
 
-def detect(df, raw_df):
-    """Run protocol rule-based filter then ML models (Volume rules removed)"""
+def detect(df, raw_df, cycle):
+    """Run protocol rule-based filter then ML models"""
     if df is None or len(df) == 0:
-        print("[-] No flows to analyse")
+        logger.warning(f"Cycle {cycle}: No flows to analyse")
         return
 
     total = len(df)
-    print(f"\n[*] Analysing {total} flows...")
 
     # ── Protocol Rule-Based Detection ────────────────────────
-    syn_ratio = (raw_df['bidirectional_syn_packets'] == 1).mean() \
-                if 'bidirectional_syn_packets' in raw_df.columns else 0
-
-    zero_dur_ratio = (raw_df['bidirectional_duration_ms'] == 0).mean() \
-                     if 'bidirectional_duration_ms' in raw_df.columns else 0
-
-    single_src = raw_df['src_ip'].nunique() \
-                 if 'src_ip' in raw_df.columns else 99
-
-    total_packets = raw_df['bidirectional_packets'].sum() \
-                    if 'bidirectional_packets' in raw_df.columns else 0
-
+    syn_ratio = (raw_df['bidirectional_syn_packets'] == 1).mean() if 'bidirectional_syn_packets' in raw_df.columns else 0
+    zero_dur_ratio = (raw_df['bidirectional_duration_ms'] == 0).mean() if 'bidirectional_duration_ms' in raw_df.columns else 0
+    single_src = raw_df['src_ip'].nunique() if 'src_ip' in raw_df.columns else 0
+    total_packets = raw_df['bidirectional_packets'].sum() if 'bidirectional_packets' in raw_df.columns else 0
     pkt_per_flow = total_packets / total if total > 0 else 0
 
     rule_ddos = False
     rule_reason = ""
 
-    # Rule 1 — SYN flood: high SYN ratio + high zero duration 
-    # (Kept minimum 1000 flows just to prevent false alarms on background noise)
     if syn_ratio >= 0.25 and zero_dur_ratio >= 0.25 and total > 1000:
         rule_ddos = True
         rule_reason = f"SYN flood (SYN: {syn_ratio:.1%}, zero-dur: {zero_dur_ratio:.1%})"
 
-    print(f"\n[RULE] SYN: {syn_ratio:.1%} | Zero-Dur: {zero_dur_ratio:.1%} | "
-          f"Srcs: {single_src} | Flows: {total:,} | Pkts/Flow: {pkt_per_flow:.1f}")
+    logger.info(f"Cycle {cycle} Stats | SYN: {syn_ratio:.1%} | Zero-Dur: {zero_dur_ratio:.1%} | Srcs: {single_src} | Flows: {total:,} | Pkts/Flow: {pkt_per_flow:.1f}")
 
     if rule_ddos:
-        print(f"  ⚠  Rule triggered: {rule_reason}")
+        logger.warning(f"Cycle {cycle}: Rule triggered: {rule_reason}")
 
     # ── ML Models ───────────────────────────────────────
     X = scaler.transform(df)
@@ -241,71 +237,83 @@ def detect(df, raw_df):
     iso_raw   = iso.predict(X)
     iso_preds = [1 if x == -1 else 0 for x in iso_raw]
 
-    rf_ddos  = int(sum(rf_preds))
-    xgb_ddos = int(sum(xgb_preds))
-    iso_ddos = int(sum(iso_preds))
+    rf_ratio  = int(sum(rf_preds)) / total
+    xgb_ratio = int(sum(xgb_preds)) / total
+    iso_ratio = int(sum(iso_preds)) / total
 
-    # ── Confidence Thresholds ────────────────────────────
-    rf_ratio  = rf_ddos / total
-    xgb_ratio = xgb_ddos / total
-    iso_ratio = iso_ddos / total
-
-    # Minimum flow threshold — results unreliable below this
     min_flows = 20
     enough_data = total >= min_flows
 
     supervised_alert = rf_ratio >= 0.30 and xgb_ratio >= 0.30 and enough_data
-    rule_alert = rule_ddos
     high_confidence = rf_ratio >= 0.60 and xgb_ratio >= 0.60 and enough_data
     
-    print(f"\n[STATS] RF: {rf_ratio:.1%} flagged | "
-          f"XGB: {xgb_ratio:.1%} flagged | "
-          f"ISO: {iso_ratio:.1%} flagged")
-
-    print("\n" + "-"*55)
+    logger.info(f"Cycle {cycle} ML Flags | RF: {rf_ratio:.1%} | XGB: {xgb_ratio:.1%} | ISO: {iso_ratio:.1%}")
 
     # ── Final Verdict ────────────────────────────────────
-    if rule_alert:
-        print("  🚨 FINAL VERDICT: DDoS ATTACK DETECTED!")
-        print(f"     Protocol Anomaly — {rule_reason}")
-    elif supervised_alert and rule_alert:
-        print("  🚨 FINAL VERDICT: DDoS ATTACK DETECTED!")
-        print(f"     Rule + ML consensus ({rf_ratio:.1%} of flows flagged)")
+    if rule_ddos:
+        logger.critical(f"Cycle {cycle} 🚨 FINAL VERDICT: DDoS ATTACK DETECTED! (Protocol Anomaly — {rule_reason})")
+    elif supervised_alert and rule_ddos:
+        logger.critical(f"Cycle {cycle} 🚨 FINAL VERDICT: DDoS ATTACK DETECTED! (Rule + ML consensus: {rf_ratio:.1%} of flows flagged)")
     elif high_confidence and enough_data:
-        print("  🚨 FINAL VERDICT: DDoS ATTACK DETECTED!")
-        print(f"     High ML confidence ({rf_ratio:.1%} of flows flagged)")
-    elif supervised_alert and not rule_alert and enough_data:
-        print("  ⚠  FINAL VERDICT: SUSPICIOUS TRAFFIC")
-        print(f"     ML flags {rf_ratio:.1%} of {total} flows — monitor closely")
+        logger.critical(f"Cycle {cycle} 🚨 FINAL VERDICT: DDoS ATTACK DETECTED! (High ML confidence: {rf_ratio:.1%} of flows flagged)")
+    elif supervised_alert and not rule_ddos and enough_data:
+        logger.warning(f"Cycle {cycle} ⚠  FINAL VERDICT: SUSPICIOUS TRAFFIC (ML flags {rf_ratio:.1%} of {total} flows)")
     else:
-        print("  ✅ FINAL VERDICT: Traffic appears BENIGN")
         if not enough_data:
-            print(f"     Insufficient flows ({total}) for reliable ML analysis")
+            logger.info(f"Cycle {cycle} ✅ FINAL VERDICT: BENIGN (Insufficient flows: {total})")
         else:
-            print(f"     RF: {rf_ratio:.1%} | XGB: {xgb_ratio:.1%} — within normal range")
-    print("="*55 + "\n")
+            logger.info(f"Cycle {cycle} ✅ FINAL VERDICT: BENIGN (Within normal range)")
 
-# ─── MAIN LOOP ────────────────────────────────────────
-print("="*55)
-print("  FYP DDoS Detection System — TP077433")
-print("  Interface:", INTERFACE)
-print("  Cycle Duration:", CAPTURE_TIME, "seconds")
-print("="*55 + "\n")
+def analysis_worker():
+    """Worker thread that processes pcaps from the queue."""
+    while True:
+        cycle, pcap_path = analysis_queue.get()
+        if pcap_path is None:  # Sentinel value to exit
+            break
 
-cycle = 1
-while True:
-    print(f"─── Cycle {cycle} " + "─"*38)
-    try:
-        if capture_traffic():
-            raw_df = pcap_to_flows(PCAP_FILE)
+        logger.info(f"Starting analysis for Cycle {cycle}")
+        try:
+            raw_df = pcap_to_flows(pcap_path)
             if raw_df is not None:
                 df = preprocess_flows(raw_df.copy())
-                detect(df, raw_df)
-    except KeyboardInterrupt:
-        print("\n[*] Detection system stopped")
-        break
-    except Exception as e:
-        print(f"[-] Error in cycle {cycle}: {e}")
+                detect(df, raw_df, cycle)
+        except Exception as e:
+            logger.error(f"Error during analysis of Cycle {cycle}: {e}")
+        finally:
+            # Clean up pcap file after analysis
+            if pcap_path and os.path.exists(pcap_path):
+                try:
+                    os.remove(pcap_path)
+                except Exception as e:
+                    logger.warning(f"Failed to delete {pcap_path}: {e}")
+            analysis_queue.task_done()
 
-    cycle += 1
-    time.sleep(2)
+# ─── MAIN ──────────────────────────────────────────────
+if __name__ == "__main__":
+    logger.info("="*55)
+    logger.info("  FYP DDoS Detection System — TP077433")
+    logger.info(f"  Interface: {INTERFACE}")
+    logger.info(f"  Cycle Duration: {CAPTURE_TIME} seconds")
+    logger.info("="*55)
+
+    # Start analysis thread
+    analyzer_thread = threading.Thread(target=analysis_worker, daemon=True)
+    analyzer_thread.start()
+
+    cycle = 1
+    try:
+        while True:
+            pcap_path = capture_traffic(cycle)
+            if pcap_path:
+                # Put the captured file in the queue for the analyzer thread
+                analysis_queue.put((cycle, pcap_path))
+            cycle += 1
+    except KeyboardInterrupt:
+        logger.info("Detection system stopped by user")
+    except Exception as e:
+        logger.error(f"Main loop error: {e}")
+    finally:
+        # Signal the analyzer thread to stop and wait for it
+        analysis_queue.put((None, None))
+        analyzer_thread.join(timeout=5)
+        logger.info("System shutdown complete")
