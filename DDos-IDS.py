@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 import subprocess
 import os
+import sys
 import time
 import argparse
 import logging
@@ -83,9 +84,10 @@ def pcap_to_flows(pcap_path):
             logger.warning(f"pcap file not found: {pcap_path}")
             return None
 
-        # Run cicflowmeter as a subprocess
+        # Run cicflowmeter as a subprocess using its absolute path from the venv
+        cic_bin = os.path.join(os.path.dirname(sys.executable), 'cicflowmeter')
         proc = subprocess.Popen([
-            'cicflowmeter', '-f', pcap_path, '-c', csv_path
+            cic_bin, '-f', pcap_path, '-c', csv_path
         ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         proc.wait()
 
