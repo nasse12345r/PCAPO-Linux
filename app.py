@@ -6,6 +6,12 @@ import os
 import queue
 import subprocess
 import tempfile
+import os
+
+# Fix OpenBLAS memory allocation issue on Windows
+os.environ['OPENBLAS_NUM_THREADS'] = '1'
+os.environ['OMP_NUM_THREADS'] = '1'
+
 import numpy as np
 import pandas as pd
 import joblib
