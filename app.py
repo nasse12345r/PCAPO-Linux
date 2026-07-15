@@ -15,6 +15,8 @@ os.environ['OMP_NUM_THREADS'] = '1'
 import numpy as np
 import pandas as pd
 import joblib
+import sklearn
+import xgboost
 import logging
 import warnings
 from nfstream import NFStreamer
