@@ -6,6 +6,12 @@ import os
 import queue
 import subprocess
 import tempfile
+import os
+
+# Fix OpenBLAS memory allocation issue on Windows
+os.environ['OPENBLAS_NUM_THREADS'] = '1'
+os.environ['OMP_NUM_THREADS'] = '1'
+
 import numpy as np
 import pandas as pd
 import joblib
@@ -34,17 +40,26 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger(__name__)
 
 # ─── LOAD MODELS ──────────────────────────────────────
-try:
-    logger.info("Loading models...")
-    rf       = joblib.load(os.path.join(MODEL_PATH, 'random_forest.pkl'))
-    xgb      = joblib.load(os.path.join(MODEL_PATH, 'xgboost.pkl'))
-    iso      = joblib.load(os.path.join(MODEL_PATH, 'isolation_forest.pkl'))
-    scaler   = joblib.load(os.path.join(MODEL_PATH, 'scaler.pkl'))
-    features = joblib.load(os.path.join(MODEL_PATH, 'feature_names.pkl'))
-    logger.info("Models loaded successfully")
-except Exception as e:
-    logger.error(f"Failed to load models: {e}")
-    # In a real app, you might want to display this on the UI instead of exiting
+rf = None
+xgb = None
+iso = None
+scaler = None
+features = None
+
+def load_models():
+    global rf, xgb, iso, scaler, features
+    if rf is not None:
+        return
+    try:
+        logger.info("Loading models...")
+        rf       = joblib.load(os.path.join(MODEL_PATH, 'random_forest.pkl'))
+        xgb      = joblib.load(os.path.join(MODEL_PATH, 'xgboost.pkl'))
+        iso      = joblib.load(os.path.join(MODEL_PATH, 'isolation_forest.pkl'))
+        scaler   = joblib.load(os.path.join(MODEL_PATH, 'scaler.pkl'))
+        features = joblib.load(os.path.join(MODEL_PATH, 'feature_names.pkl'))
+        logger.info("Models loaded successfully")
+    except Exception as e:
+        logger.error(f"Failed to load models: {e}")
 
 # ─── IDS LOGIC ────────────────────────────────────────
 
@@ -62,15 +77,15 @@ def capture_traffic(cycle):
         if os.path.exists(pcap_file):
             os.remove(pcap_file)
 
-        # tshark is the command-line version of Wireshark.
+        # dumpcap is the underlying capture engine for Wireshark. It is safer on Windows as it doesn't invoke external tools like etwdump
         # -i: interface, -a: duration:10 (auto-stop after 10 seconds), -w: write to file, -q: quiet mode
         proc = subprocess.Popen([
-            'tshark', '-i', INTERFACE, '-a', f'duration:{CAPTURE_TIME}', '-w', pcap_file, '-q'
+            'dumpcap', '-i', INTERFACE, '-a', f'duration:{CAPTURE_TIME}', '-w', pcap_file, '-q'
         ], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
-        _, stderr = proc.communicate() # tshark auto-terminates due to '-a duration'
+        _, stderr = proc.communicate() # dumpcap auto-terminates due to '-a duration'
         if proc.returncode != 0:
-            logger.error(f"tshark error: {stderr.decode()}")
+            logger.error(f"dumpcap error: {stderr.decode()}")
             socketio.emit('log', {'timestamp': time.strftime('%H:%M:%S'), 'level': 'ERROR', 'message': f"Capture error: {stderr.decode()}"})
             time.sleep(2)
             return None
@@ -88,10 +103,12 @@ def pcap_to_flows(pcap_path):
         if not os.path.exists(pcap_path):
             return None
 
+        # n_meters=1 disables multiprocessing in NFStream, which prevents memory spikes and process locks on Windows
         streamer = NFStreamer(
             source=pcap_path,
             statistical_analysis=True,
-            splt_analysis=0
+            splt_analysis=0,
+            n_meters=1
         )
         df = streamer.to_pandas()
 
@@ -396,6 +413,9 @@ def stop_ids():
     return jsonify({'status': 'stopped'})
 
 if __name__ == '__main__':
+    # Lazy load models in the main process only to prevent multiprocessing conflicts on Windows
+    load_models()
+
     # Run the web server
     logger.info("Starting Web Server on http://localhost:5000")
     socketio.run(app, host='0.0.0.0', port=5000, allow_unsafe_werkzeug=True)
