@@ -218,6 +218,11 @@ def preprocess_flows(df):
     df = pd.concat([df, missing_df], axis=1)
 
     final_df = pd.DataFrame()
+
+    if features is None:
+        logger.error("Features list is not loaded. Cannot preprocess flows.")
+        return None
+
     for col in features:
         if col in df.columns:
             final_df[col] = df[col].values
@@ -231,6 +236,18 @@ def preprocess_flows(df):
 
 def detect(df, cycle):
     """Run ML models and emit results to WebSocket"""
+    if rf is None or xgb is None or iso is None or scaler is None or features is None:
+        msg = f"Cycle {cycle} Verdict: ERROR - ML Models not loaded. Please replace corrupted .pkl files."
+        logger.error(msg)
+        socketio.emit('log', {'timestamp': time.strftime('%H:%M:%S'), 'level': 'ERROR', 'message': msg})
+        payload = {
+            'cycle': cycle, 'timestamp': time.strftime('%H:%M:%S'),
+            'total_flows': len(df) if df is not None else 0, 'rf_percent': 0, 'xgb_percent': 0, 'iso_percent': 0,
+            'status': "danger", 'verdict': "ERROR - Models missing"
+        }
+        socketio.emit('update_stats', payload)
+        return
+
     if df is None or len(df) == 0:
         socketio.emit('log', {'timestamp': time.strftime('%H:%M:%S'), 'level': 'WARNING', 'message': f"Cycle {cycle}: No flows to analyse"})
         return
