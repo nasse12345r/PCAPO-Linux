@@ -60,6 +60,17 @@ def load_models():
         logger.info("Models loaded successfully")
     except Exception as e:
         logger.error(f"Failed to load models: {e}")
+        # Debugging aid for corrupted files
+        for model_file in ['random_forest.pkl', 'xgboost.pkl', 'isolation_forest.pkl', 'scaler.pkl', 'feature_names.pkl']:
+            path = os.path.join(MODEL_PATH, model_file)
+            if os.path.exists(path):
+                size = os.path.getsize(path)
+                logger.info(f"File {model_file}: Size={size} bytes")
+                if size < 100:
+                    with open(path, 'r', errors='ignore') as mf:
+                        logger.info(f"Content preview of {model_file}: {mf.read()[:50]}")
+            else:
+                logger.info(f"File {model_file}: NOT FOUND")
 
 # ─── IDS LOGIC ────────────────────────────────────────
 
